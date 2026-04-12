@@ -9,8 +9,8 @@ CFTC Positioning Replicator
      含多头/空头/净持仓的 position, z-score, w/w change
 
 用法:
-    python3 delta_one_replicator.py              # 最新一期
-    python3 delta_one_replicator.py --date 2026-03-17  # 指定日期
+    python3 cftc_持仓分析.py              # 最新一期
+    python3 cftc_持仓分析.py --date 2026-03-17  # 指定日期
 """
 
 import pandas as pd
@@ -22,6 +22,7 @@ from html import escape
 import sys
 import warnings
 import time
+import os
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -606,15 +607,55 @@ def generate_html(df_tff, df_disagg, report_date, price_data=None):
 
 
 # ============================================================================
+# HELP DISPLAY
+# ============================================================================
+
+def print_help():
+    help_text = """
+=============================================================
+CFTC 持仓分析工具 (CFTC Positioning Replicator)
+=============================================================
+复制 JPM Delta-One Table 12: Traders in Financial Futures & COT Disaggregated
+
+数据来源: CFTC Socrata API (免费, 无需API key)
+输出: 在当前目录的 `0_持仓报告` 文件夹下生成 HTML 报告。
+
+用法 (Usage):
+    python cftc_持仓分析.py              # 获取最新一期的持仓数据
+    python cftc_持仓分析.py --date <日期> # 获取指定日期的持仓数据 (格式: YYYY-MM-DD)
+    python cftc_持仓分析.py -h, --help   # 显示此帮助信息
+
+示例 (Examples):
+    python cftc_持仓分析.py
+    python cftc_持仓分析.py --date 2026-03-17
+=============================================================
+"""
+    print(help_text)
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
+    # 检查是否传入帮助命令
+    if '-h' in sys.argv or '--help' in sys.argv:
+        print_help()
+        sys.exit(0)
+
     target_date = None
     if '--date' in sys.argv:
         idx = sys.argv.index('--date')
         if idx + 1 < len(sys.argv):
             target_date = sys.argv[idx + 1]
+
+    output_dir = "0_持仓报告"
+    
+    # 提前检查：如果指定了日期，且该日期的文件已存在于文件夹中，则直接跳过下载
+    if target_date:
+        expected_file = os.path.join(output_dir, f'cftc_持仓报告_{target_date}.html')
+        if os.path.exists(expected_file):
+            print(f"⏭️ 目标文件 {expected_file} 已存在，跳过下载与生成。")
+            return
 
     start_date = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime('%Y-%m-%d')
 
@@ -642,6 +683,13 @@ def main():
     report_date = df_tff['report_date'].max().strftime('%Y-%m-%d') if not df_tff.empty else 'N/A'
     print(f"  Report date: {report_date}")
 
+    # 二次检查：如果在没传 --date 跑最新数据的情况下发现文件已存在，也可在此拦截
+    if not target_date and report_date != 'N/A':
+        expected_file = os.path.join(output_dir, f'cftc_持仓报告_{report_date}.html')
+        if os.path.exists(expected_file):
+            print(f"⏭️ 最新报告 {expected_file} 已存在，跳过剩余步骤。")
+            return
+
     # 2. Fetch price data (Tue→Tue 同期价格变动)
     print("\n[2/4] Fetching price data (Tue→Tue)...")
     all_contracts = TFF_CONTRACTS + DISAGG_CONTRACTS
@@ -658,7 +706,9 @@ def main():
     print("\n[4/4] Writing HTML...")
     html = generate_html(df_t12_tff, df_t12_disagg, report_date, price_data)
 
-    output_file = f'cftc_持仓报告_{report_date}.html'
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f'cftc_持仓报告_{report_date}.html')
+
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(html)
     print(f"  -> {output_file}")
