@@ -7,7 +7,7 @@ import sys
 
 # ================= 配置区 =================
 # 主脚本的文件名
-MASTER_SCRIPT = "cftc_持仓分析.py"
+MASTER_SCRIPT = "cftc_position_analysis.py"
 # 每次请求之间的间隔（秒），防止被API封禁或请求过快
 SLEEP_INTERVAL = 2
 # ==========================================
@@ -82,12 +82,12 @@ def print_help():
     print("CFTC 持仓分析批量执行工具 (Batch Executor)")
     print("=====================================================")
     print("用法:")
-    print("  python batch_executor.py <起始时间> <结束时间>")
+    print("  python cftc_batch_executor.py <起始时间> <结束时间>")
     print("\n参数说明:")
     print("  <起始时间> : 格式为 YYYY-MM-DD (如 2025-01-01)")
     print("  <结束时间> : 格式为 YYYY-MM-DD (如 2026-04-10)")
     print("\n示例:")
-    print("  python batch_executor.py 2025-01-01 2026-04-10")
+    print("  python cftc_batch_executor.py 2025-01-01 2026-04-10")
     print("=====================================================")
 
 if __name__ == "__main__":
