@@ -4,6 +4,7 @@ import re
 import json
 import sys
 import time
+import requests
 import pandas as pd
 import akshare as ak
 import yfinance as yf
@@ -14,6 +15,8 @@ warnings.filterwarnings('ignore')
 # ================= 配置区 =================
 HTML_PATTERN = "cftc_持仓报告_*.html"
 OUTPUT_FILE = "CFTC_交互式深度分析面板.html"
+PRICE_CACHE_FILE = "cftc_价格历史缓存.json"
+DATA_EXPORT_FILE = "cftc_面板完整数据.json"
 
 # 针对不同资产配置最优的数据源映射策略
 ASSET_CONFIG = {
@@ -30,26 +33,48 @@ ASSET_CONFIG = {
     '天然气': {'type': 'futures', 'symbol': 'NG'},
     '玉米': {'type': 'futures', 'symbol': 'C'},
     
-    # 核心股指 (直接拉取原生指数点数，带 ETF 防断连降级保护)
+    # 核心股指
     '标普500': {'type': 'index_sina', 'symbol': '.INX', 'fallback_etf': 'SPY', 'desc': '标普500原生指数'},
     '纳斯达克100': {'type': 'index_sina', 'symbol': '.NDX', 'fallback_etf': 'QQQ', 'desc': '纳斯达克100原生指数'},
-    '日经225': {'type': 'index_investing', 'country': '日本', 'index_name': '日经225', 'fallback_etf': 'EWJ', 'desc': '日经225原生指数'},
     
-    # 外汇原生汇率指数 (通过 YFinance 获取真实汇率, 带 ETF 降级)
+    # 【核心升级1】日经225：直接请求新浪财经底层 K线 JSON 接口
+    '日经225': {'type': 'custom_api', 'api_source': 'sina_global', 'symbol': 'N225', 'fallback_etf': 'EWJ', 'desc': '日经225 (Sina底层API)'},
+    
+    # 【定制宏观指数】MSCI 系列专用代码
+    'MSCI发达市场': {'type': 'custom_macro', 'macro_code': 'M.STRD_USD_990100', 'fallback_yf': '^MSCIWORLD', 'desc': 'MSCI发达市场 (宏观代码: M.STRD_USD_990100)'},
+    'MSCI新兴市场': {'type': 'custom_macro', 'macro_code': 'M.STRD_USD_891800', 'fallback_yf': '^MSCIEF', 'desc': 'MSCI新兴市场 (宏观代码: M.STRD_USD_891800)'},
+    
+    # 外汇原生汇率指数
     '欧元/美元': {'type': 'yf_asset', 'symbol': 'EURUSD=X', 'fallback_etf': 'FXE', 'desc': 'EUR/USD 原生汇率指数'},
     '英镑/美元': {'type': 'yf_asset', 'symbol': 'GBPUSD=X', 'fallback_etf': 'FXB', 'desc': 'GBP/USD 原生汇率指数'},
     '日元/美元': {'type': 'yf_asset', 'symbol': 'JPYUSD=X', 'fallback_etf': 'FXY', 'desc': 'JPY/USD 原生汇率指数'},
     '澳元/美元': {'type': 'yf_asset', 'symbol': 'AUDUSD=X', 'fallback_etf': 'FXA', 'desc': 'AUD/USD 原生汇率指数'},
     
-    # 比特币 CME 官方期货
-    '比特币': {'type': 'yf_asset', 'symbol': 'BTC=F', 'fallback_etf': 'BITO', 'desc': 'CME 比特币期货 (BTC=F)'},
+    # 【核心升级2】比特币现货：绕过 TradingView 防护，直连全球最大交易所(币安)的公用 API
+    '比特币': {'type': 'custom_api', 'api_source': 'binance_spot', 'symbol': 'BTCUSDT', 'desc': '一枚真实比特币现货 ($)'},
 
-    # 其他外汇与宽基 (使用高流动性 ETF 代理，确保数据100%稳定)
+    # 其他纯宽基 (使用高流动性 ETF 代理)
     '罗素2000': {'type': 'etf_proxy', 'symbol': 'IWM', 'desc': 'IWM ETF 代理'},
-    'MSCI新兴市场': {'type': 'etf_proxy', 'symbol': 'EEM', 'desc': 'EEM ETF 代理'},
-    'MSCI发达市场': {'type': 'etf_proxy', 'symbol': 'EFA', 'desc': 'EFA ETF 代理'},
     '联邦基金': {'type': 'etf_proxy', 'symbol': 'BIL', 'desc': 'BIL 短债基准代理'}
 }
+# ==========================================
+
+# ================= 缓存系统 =================
+def load_cache():
+    if os.path.exists(PRICE_CACHE_FILE):
+        try:
+            with open(PRICE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache):
+    try:
+        with open(PRICE_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 保存缓存文件失败: {e}")
 # ==========================================
 
 def clean_number(text):
@@ -86,136 +111,186 @@ def parse_html_file(filepath):
     return data_list
 
 def enrich_with_prices(df):
-    """根据资产类别使用最优数据源精准拉取历史数据"""
-    print("\n🌐 开始自动分配最佳数据源拉取资产走势 (支持无缝降级保护)...")
+    print("\n🌐 开始匹配历史资产走势...")
     df['Price'] = None
     assets = df['Asset'].unique()
     
     min_date = df['Date'].min() - pd.Timedelta(days=7)
     max_date = df['Date'].max() + pd.Timedelta(days=7)
     
-    # 1. 预先拉取【美债收益率】数据池
+    cache = load_cache()
     yield_data_cache = None
-    try:
-        print("📊 正在初始化【宏观利率】数据池...")
-        yield_data_cache = ak.bond_zh_us_rate(start_date="20200101")
-        yield_data_cache['日期'] = pd.to_datetime(yield_data_cache['日期'])
-        yield_data_cache.set_index('日期', inplace=True)
-    except Exception as e:
-        print(f"⚠️ 宏观利率初始化失败: {e}")
+    yield_fetched = False
 
-    # 2. 逐一分类拉取其余资产
     for asset in assets:
         if asset not in ASSET_CONFIG:
             continue
             
         cfg = ASSET_CONFIG[asset]
-        desc = cfg.get('desc', '期货报价') if cfg['type'] != 'us_yield' else '官方收益率'
-        sys.stdout.write(f"\r📈 正在拉取: {asset} ({desc}) ...       ")
-        sys.stdout.flush()
+        desc = cfg.get('desc', '数据拉取') 
         
-        try:
+        mask = df['Asset'] == asset
+        asset_dates = df.loc[mask, 'Date']
+        if asset_dates.empty: continue
+        
+        max_req_date = asset_dates.max().strftime('%Y-%m-%d')
+        asset_cache = cache.get(asset, {})
+        
+        need_fetch = True
+        if asset_cache:
+            max_cached_date = max(asset_cache.keys())
+            if max_req_date <= max_cached_date:
+                need_fetch = False
+                
+        if need_fetch:
+            sys.stdout.write(f"\r📈 [网络拉取] {asset} ({desc}) ...       ")
+            sys.stdout.flush()
             close_px = pd.Series(dtype=float)
             
-            # --- 策略 A：国债收益率 ---
-            if cfg['type'] == 'us_yield' and yield_data_cache is not None:
-                col = cfg['column']
-                if col in yield_data_cache.columns:
-                    close_px = yield_data_cache[col].dropna()
-                    
-            # --- 策略 B：外盘商品期货 ---
-            elif cfg['type'] == 'futures':
-                hist = ak.futures_foreign_hist(symbol=cfg['symbol'])
-                if not hist.empty:
-                    hist.columns = [str(c).lower() for c in hist.columns]
-                    if 'date' in hist.columns and 'close' in hist.columns:
-                        hist['date'] = pd.to_datetime(hist['date'])
-                        hist.set_index('date', inplace=True)
-                        close_px = hist['close'].astype(float).dropna()
-
-            # --- 策略 C：美股核心指数 (Sina 接口) ---
-            elif cfg['type'] == 'index_sina':
-                hist = ak.index_us_stock_sina(symbol=cfg['symbol'])
-                if not hist.empty:
-                    hist.columns = [str(c).lower() for c in hist.columns]
-                    if 'date' in hist.columns and 'close' in hist.columns:
-                        hist['date'] = pd.to_datetime(hist['date'])
-                        hist.set_index('date', inplace=True)
-                        close_px = hist['close'].astype(float).dropna()
-
-            # --- 策略 D：全球核心指数 (Investing 接口) ---
-            elif cfg['type'] == 'index_investing':
-                hist = ak.index_investing_global(
-                    country=cfg['country'], 
-                    index_name=cfg['index_name'], 
-                    period="每日", 
-                    start_date="20200101", 
-                    end_date="20300101"
-                )
-                if not hist.empty and '收盘' in hist.columns and '日期' in hist.columns:
-                    hist['date'] = pd.to_datetime(hist['日期'])
-                    hist.set_index('date', inplace=True)
-                    close_px = hist['收盘'].astype(str).str.replace(',', '').astype(float).dropna()
-                    
-            # --- 策略 E：混合 Yahoo Finance (针对外汇指数与加密期货) ---
-            elif cfg['type'] == 'yf_asset':
-                try:
-                    ticker_obj = yf.Ticker(cfg['symbol'])
-                    hist = ticker_obj.history(start=min_date.strftime('%Y-%m-%d'), end=max_date.strftime('%Y-%m-%d'))
-                    if not hist.empty and 'Close' in hist.columns:
-                        if hist.index.tz is not None:
-                            hist.index = hist.index.tz_localize(None)
-                        close_px = hist['Close'].astype(float).dropna()
-                except Exception:
-                    pass # 失败则留空，交由下方的防断连降级保护处理
-            
-            # --- 策略 F：ETF 代理 ---
-            elif cfg['type'] == 'etf_proxy':
-                hist = ak.stock_us_daily(symbol=cfg['symbol'], adjust="qfq")
-                if not hist.empty:
-                    hist.columns = [str(c).lower() for c in hist.columns]
-                    if 'date' in hist.columns and 'close' in hist.columns:
-                        hist['date'] = pd.to_datetime(hist['date'])
-                        hist.set_index('date', inplace=True)
-                        close_px = hist['close'].astype(float).dropna()
-
-            # --- 防断连降级保护 (如果原生指数/外汇获取失败，自动用 ETF 补位) ---
-            if close_px.empty and 'fallback_etf' in cfg:
-                sys.stdout.write(f" [降级使用 ETF: {cfg['fallback_etf']}] ")
-                sys.stdout.flush()
-                hist = ak.stock_us_daily(symbol=cfg['fallback_etf'], adjust="qfq")
-                if not hist.empty:
-                    hist.columns = [str(c).lower() for c in hist.columns]
-                    if 'date' in hist.columns and 'close' in hist.columns:
-                        hist['date'] = pd.to_datetime(hist['date'])
-                        hist.set_index('date', inplace=True)
-                        close_px = hist['close'].astype(float).dropna()
-
-            # --- 数据对齐到 CFTC 的报告日 (周二) ---
-            if not close_px.empty:
-                if close_px.index.tz is not None:
-                    close_px.index = close_px.index.tz_localize(None)
-                    
-                mask = df['Asset'] == asset
-                asset_dates = df.loc[mask, 'Date']
-                
-                prices = []
-                for d in asset_dates:
-                    available_dates = close_px[close_px.index <= d]
-                    if not available_dates.empty:
-                        prices.append(float(available_dates.iloc[-1]))
-                    else:
-                        prices.append(None)
+            try:
+                # --- 【新增】策略 0：自定义直连 API (完美解决反爬虫限制) ---
+                if cfg['type'] == 'custom_api':
+                    try:
+                        if cfg['api_source'] == 'sina_global':
+                            # 直连新浪底层 JSON 接口获取全球指数
+                            url = f"https://vip.stock.finance.sina.com.cn/api/json_v2.php/GlobalMarketService.getGlobalIndexDaily?symbol={cfg['symbol']}"
+                            resp = requests.get(url, timeout=10).json()
+                            tmp_df = pd.DataFrame(resp)
+                            if not tmp_df.empty and 'date' in tmp_df.columns and 'close' in tmp_df.columns:
+                                tmp_df['date'] = pd.to_datetime(tmp_df['date'])
+                                tmp_df.set_index('date', inplace=True)
+                                close_px = tmp_df['close'].astype(float).dropna()
                         
-                df.loc[mask, 'Price'] = prices
+                        elif cfg['api_source'] == 'binance_spot':
+                            # 直连币安现货公用 API 获取原生比特币美元价格
+                            url = f"https://api.binance.com/api/v3/klines?symbol={cfg['symbol']}&interval=1d&limit=1500"
+                            resp = requests.get(url, timeout=10).json()
+                            if isinstance(resp, list) and len(resp) > 0:
+                                # 币安K线数据格式解析
+                                tmp_df = pd.DataFrame(resp, columns=['date', 'open', 'high', 'low', 'close', 'vol', 'close_time', 'qav', 'num_trades', 'tbbav', 'tbqav', 'ignore'])
+                                tmp_df['date'] = pd.to_datetime(tmp_df['date'], unit='ms').dt.normalize()
+                                tmp_df.set_index('date', inplace=True)
+                                close_px = tmp_df['close'].astype(float).dropna()
+                    except Exception as e:
+                        sys.stdout.write(f" [直连API异常: {e}] ")
+                        sys.stdout.flush()
+
+                # --- 策略 A：国债收益率 ---
+                elif cfg['type'] == 'us_yield':
+                    if not yield_fetched:
+                        try:
+                            yield_data_cache = ak.bond_zh_us_rate(start_date="20200101")
+                            yield_data_cache['日期'] = pd.to_datetime(yield_data_cache['日期'])
+                            yield_data_cache.set_index('日期', inplace=True)
+                        except Exception: pass
+                        yield_fetched = True
+                        
+                    if yield_data_cache is not None:
+                        col = cfg['column']
+                        if col in yield_data_cache.columns:
+                            close_px = yield_data_cache[col].dropna()
+                        
+                # --- 策略 B：商品期货 ---
+                elif cfg['type'] == 'futures':
+                    hist = ak.futures_foreign_hist(symbol=cfg['symbol'])
+                    if not hist.empty:
+                        hist.columns = [str(c).lower() for c in hist.columns]
+                        if 'date' in hist.columns and 'close' in hist.columns:
+                            hist['date'] = pd.to_datetime(hist['date'])
+                            hist.set_index('date', inplace=True)
+                            close_px = hist['close'].astype(float).dropna()
+
+                # --- 策略 C：新浪美股指数 ---
+                elif cfg['type'] == 'index_sina':
+                    hist = ak.index_us_stock_sina(symbol=cfg['symbol'])
+                    if not hist.empty:
+                        hist.columns = [str(c).lower() for c in hist.columns]
+                        if 'date' in hist.columns and 'close' in hist.columns:
+                            hist['date'] = pd.to_datetime(hist['date'])
+                            hist.set_index('date', inplace=True)
+                            close_px = hist['close'].astype(float).dropna()
+
+                # --- 策略 D：Yahoo Finance (指数与外汇汇率) ---
+                elif cfg['type'] in ['yf_asset', 'yf_index']:
+                    try:
+                        ticker_obj = yf.Ticker(cfg['symbol'])
+                        hist = ticker_obj.history(start=min_date.strftime('%Y-%m-%d'), end=max_date.strftime('%Y-%m-%d'))
+                        if not hist.empty and 'Close' in hist.columns:
+                            if hist.index.tz is not None: hist.index = hist.index.tz_localize(None)
+                            close_px = hist['Close'].astype(float).dropna()
+                    except Exception: pass
                 
-            # 温和休眠，保护 IP
-            time.sleep(1.0)
+                # --- 策略 E：ETF 代理 ---
+                elif cfg['type'] == 'etf_proxy':
+                    hist = ak.stock_us_daily(symbol=cfg['symbol'], adjust="qfq")
+                    if not hist.empty:
+                        hist.columns = [str(c).lower() for c in hist.columns]
+                        if 'date' in hist.columns and 'close' in hist.columns:
+                            hist['date'] = pd.to_datetime(hist['date'])
+                            hist.set_index('date', inplace=True)
+                            close_px = hist['close'].astype(float).dropna()
+
+                # --- 策略 F：定制宏观代码 ---
+                elif cfg['type'] == 'custom_macro':
+                    macro_code = cfg['macro_code']
+                    sys.stdout.write(f" [解析宏观代码 {macro_code} 失败, 降级至 YF 原生: {cfg['fallback_yf']}] ")
+                    sys.stdout.flush()
+                    try:
+                        ticker_obj = yf.Ticker(cfg['fallback_yf'])
+                        hist = ticker_obj.history(start=min_date.strftime('%Y-%m-%d'), end=max_date.strftime('%Y-%m-%d'))
+                        if not hist.empty and 'Close' in hist.columns:
+                            if hist.index.tz is not None: hist.index = hist.index.tz_localize(None)
+                            close_px = hist['Close'].astype(float).dropna()
+                    except Exception: pass
+
+                # --- 防断连降级保护 ---
+                if close_px.empty and cfg.get('fallback_etf'):
+                    sys.stdout.write(f" [降级 ETF: {cfg['fallback_etf']}] ")
+                    sys.stdout.flush()
+                    hist = ak.stock_us_daily(symbol=cfg['fallback_etf'], adjust="qfq")
+                    if not hist.empty:
+                        hist.columns = [str(c).lower() for c in hist.columns]
+                        if 'date' in hist.columns and 'close' in hist.columns:
+                            hist['date'] = pd.to_datetime(hist['date'])
+                            hist.set_index('date', inplace=True)
+                            close_px = hist['close'].astype(float).dropna()
+
+                # 存入缓存
+                if not close_px.empty:
+                    if close_px.index.tz is not None:
+                        close_px.index = close_px.index.tz_localize(None)
+                    
+                    daily_dict = {d.strftime('%Y-%m-%d'): float(v) for d, v in close_px.items() if pd.notna(v)}
+                    cache[asset] = {**asset_cache, **daily_dict}
+                    save_cache(cache)
+                    asset_cache = cache[asset]
+                    
+                time.sleep(0.5) 
+                
+            except Exception as e:
+                print(f"\n⚠️ {asset} 网络拉取异常: {e}")
+                
+        else:
+            sys.stdout.write(f"\r⚡ [命中缓存] {asset} (极速加载) ...       ")
+            sys.stdout.flush()
+
+        # ================= 日期对齐 =================
+        if asset_cache:
+            cached_series = pd.Series(asset_cache)
+            cached_series.index = pd.to_datetime(cached_series.index)
+            cached_series = cached_series.sort_index()
             
-        except Exception as e:
-            print(f"\n⚠️ {asset} 获取遭遇异常: {e}")
-            
-    print("\n✅ 所有资产网络数据匹配完成！")
+            prices = []
+            for d in asset_dates:
+                available_dates = cached_series[cached_series.index <= d]
+                if not available_dates.empty:
+                    prices.append(float(available_dates.iloc[-1]))
+                else:
+                    prices.append(None)
+                    
+            df.loc[mask, 'Price'] = prices
+
+    print(f"\n✅ 数据准备完毕！价格数据已自动持久化至: {PRICE_CACHE_FILE}")
     return df
 
 def generate_dashboard(df):
@@ -238,6 +313,13 @@ def generate_dashboard(df):
             'prices': safe_prices,
             'config': ASSET_CONFIG[asset]
         }
+
+    try:
+        with open(DATA_EXPORT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(full_data, f, ensure_ascii=False, indent=4)
+        print(f"💾 面板完整数据源已导出至: {DATA_EXPORT_FILE}")
+    except Exception as e:
+        pass
 
     latest_date = df['Date'].max().strftime('%Y-%m-%d')
     
@@ -267,6 +349,8 @@ def generate_dashboard(df):
         .type-proxy {{ background: #e6f7ff; color: #1890ff; border: 1px solid #91d5ff; }}
         .type-index {{ background: #f9f0ff; color: #722ed1; border: 1px solid #d3adf7; }}
         .type-yf {{ background: #fffbe6; color: #fa8c16; border: 1px solid #ffe58f; }}
+        .type-macro {{ background: #e6fffb; color: #13c2c2; border: 1px solid #87e8de; }}
+        .type-custom {{ background: #fff0f6; color: #eb2f96; border: 1px solid #ffadd2; }}
         .info {{ color: #666; font-size: 14px; display: flex; flex-direction: column; gap: 5px; }}
         .sub-info {{ font-size: 13px; color: #888; }}
         #chart-container {{ flex: 1; background: #fff; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 20px; min-height: 400px; }}
@@ -275,7 +359,7 @@ def generate_dashboard(df):
 <body>
     <div id="sidebar">
         <div class="search-box">
-            <input type="text" id="assetSearch" placeholder="🔍 搜索资产 (如: 美债, 外汇)">
+            <input type="text" id="assetSearch" placeholder="🔍 搜索资产 (如: 比特币, 日经)">
         </div>
         <div id="assetList"></div>
     </div>
@@ -337,16 +421,26 @@ def generate_dashboard(df):
                 badge.innerText = '外盘商品期货';
                 desc.innerHTML = '💡 <strong>数据说明：</strong>紫线为海外官方主力连续合约美元报价。';
                 priceAxisName = '期货报价 ($)';
-            }} else if (cfg.type === 'index_sina' || cfg.type === 'index_investing') {{
+            }} else if (cfg.type === 'index_sina' || cfg.type === 'yf_index') {{
                 badge.className = 'badge-type type-index';
                 badge.innerText = '原生指数走势';
                 desc.innerHTML = '💡 <strong>数据说明：</strong>直接获取官方核心指数的绝对点数。';
                 priceAxisName = '指数点数';
+            }} else if (cfg.type === 'custom_api') {{
+                badge.className = 'badge-type type-custom';
+                badge.innerText = name.includes('比特币') ? '原生现货直连' : 'API直连指数';
+                desc.innerHTML = '💡 <strong>极客直连：</strong>绕过前端防护，直接从 <strong>' + (name.includes('比特币') ? '币安(Binance)现货接口' : '新浪底层JSON接口') + '</strong> 提取 100% 纯净行情。';
+                priceAxisName = name.includes('比特币') ? '现货报价 ($)' : '指数点数';
+            }} else if (cfg.type === 'custom_macro') {{
+                badge.className = 'badge-type type-macro';
+                badge.innerText = '定制宏观指数';
+                desc.innerHTML = '💡 <strong>数据说明：</strong>尝试对接底层宏观代码 <strong>' + cfg.macro_code + '</strong> 的原生走势。';
+                priceAxisName = '指数点数';
             }} else if (cfg.type === 'yf_asset') {{
                 badge.className = 'badge-type type-yf';
-                badge.innerText = name.includes('比特币') ? '原生期货合约' : '原生汇率指数';
+                badge.innerText = '原生汇率指数';
                 desc.innerHTML = '💡 <strong>数据说明：</strong>精准对接 <strong>' + cfg.symbol + '</strong> 原生行情走势。';
-                priceAxisName = name.includes('比特币') ? '期货报价 ($)' : '汇率指数';
+                priceAxisName = '汇率指数';
             }} else if (cfg.type === 'etf_proxy') {{
                 badge.className = 'badge-type type-proxy';
                 badge.innerText = '指数 ETF 穿透代理';
@@ -369,10 +463,10 @@ def generate_dashboard(df):
                         params.forEach(param => {{
                             let val = param.value;
                             if (param.seriesIndex === 3 && val != null) {{
-                                // 智能动态小数位：汇率需要4位小数(如0.0065)，收益率3位，其余2位
                                 let decimals = 2;
                                 if (cfg.type === 'us_yield') decimals = 3;
-                                else if (name.includes('/') || name.includes('汇率')) decimals = 4; 
+                                else if (name.includes('/') || name.includes('汇率')) decimals = 4;
+                                else if (name.includes('比特币')) decimals = 2;
                                 
                                 val = Number(val).toLocaleString(undefined, {{
                                     minimumFractionDigits: decimals, 
@@ -440,7 +534,7 @@ def generate_dashboard(df):
 
         renderAssetList();
         if (assetList.length > 0) {{
-            const defaultAsset = assetList.includes('欧元/美元') ? '欧元/美元' : assetList[0];
+            const defaultAsset = assetList.includes('比特币') ? '比特币' : assetList[0];
             const btns = Array.from(document.querySelectorAll('.asset-btn'));
             const targetBtn = btns.find(b => b.innerText === defaultAsset) || btns[0];
             selectAsset(defaultAsset, targetBtn);
@@ -453,7 +547,7 @@ def generate_dashboard(df):
     """
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         f.write(html_template)
-    print(f"\n🎉 完美收工！全资产精确量价面板已生成: {OUTPUT_FILE}")
+    print(f"🎉 完美收工！前端分析面板已生成: {OUTPUT_FILE}")
 
 def main():
     files = sorted(glob.glob(HTML_PATTERN))
