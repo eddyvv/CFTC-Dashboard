@@ -13,10 +13,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ================= 配置区 =================
-HTML_PATTERN = "cftc_持仓报告_*.html"
-OUTPUT_FILE = "CFTC_交互式深度分析面板.html"
-PRICE_CACHE_FILE = "cftc_价格历史缓存.json"
-DATA_EXPORT_FILE = "cftc_面板完整数据.json"
+DATA_DIR = "0_持仓报告"
+os.makedirs(DATA_DIR, exist_ok=True)  # 确保目标文件夹存在
+
+HTML_PATTERN = os.path.join(DATA_DIR, "cftc_持仓报告_*.html")
+OUTPUT_FILE = os.path.join(DATA_DIR, "CFTC_交互式深度分析面板.html")
+PRICE_CACHE_FILE = os.path.join(DATA_DIR, "cftc_价格历史缓存.json")
+DATA_EXPORT_FILE = os.path.join(DATA_DIR, "cftc_面板完整数据.json")
 
 # 针对不同资产配置最优的数据源映射策略
 ASSET_CONFIG = {
@@ -561,7 +564,7 @@ def generate_dashboard(df):
 def main():
     files = sorted(glob.glob(HTML_PATTERN))
     if not files:
-        print("❌ 未找到 HTML 文件，请检查当前目录。")
+        print(f"❌ 未找到 HTML 文件，请检查 {DATA_DIR} 目录。")
         return
         
     all_data = []
