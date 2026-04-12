@@ -8,14 +8,12 @@ from bs4 import BeautifulSoup
 
 # ================= 配置区 =================
 HTML_PATTERN = "cftc_持仓报告_*.html"
-OUTPUT_FILE = "cftc_历史趋势_Dashboard.html"
+OUTPUT_FILE = "CFTC_交互式深度分析面板.html"
 # ==========================================
 
 def clean_number(text):
-    """提取文本中的纯数字（保留负号）"""
-    if not text:
-        return 0
-    # 移除千位分隔符等无关字符，只保留数字和负号
+    """清理并转换数字字符串"""
+    if not text: return 0
     cleaned = re.sub(r'[^\d\-]', '', text)
     try:
         return int(cleaned) if cleaned and cleaned != '-' else 0
@@ -23,209 +21,178 @@ def clean_number(text):
         return 0
 
 def parse_html_file(filepath):
-    """解析单个CFTC HTML文件并提取核心数据"""
-    # 从文件名提取日期
+    """解析单个 HTML 报告"""
     match = re.search(r'\d{4}-\d{2}-\d{2}', filepath)
-    if not match:
-        return []
+    if not match: return []
     date_str = match.group()
     
     data_list = []
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             soup = BeautifulSoup(f, 'html.parser')
-            
-            # 找到所有表格行
             for row in soup.find_all('tr'):
                 cols = row.find_all('td')
-                
-                # 过滤掉表头和分类行 (分类行通常带有 colspan)
                 if len(cols) >= 11 and not cols[0].has_attr('colspan'):
                     asset_name = cols[0].text.strip()
-                    # 根据脚本生成的HTML格式，索引2是净持仓，5是多头，8是空头
-                    net_pos = clean_number(cols[2].text)
-                    long_pos = clean_number(cols[5].text)
-                    short_pos = clean_number(cols[8].text)
-                    
                     if asset_name:
                         data_list.append({
                             'Date': date_str,
                             'Asset': asset_name,
-                            'Net': net_pos,
-                            'Long': long_pos,
-                            'Short': short_pos
+                            'Net': clean_number(cols[2].text),
+                            'Long': clean_number(cols[5].text),
+                            'Short': clean_number(cols[8].text)
                         })
     except Exception as e:
-        print(f"⚠️ 解析文件 {filepath} 时出错: {e}")
-        
+        print(f"⚠️ 解析 {filepath} 失败: {e}")
     return data_list
 
-def generate_echarts_html(df):
-    """将 pandas DataFrame 转换为包含 ECharts 的 HTML"""
-    # 获取所有的资产名称
-    assets = df['Asset'].unique()
+def generate_dashboard(df):
+    """生成带按钮切换功能的 ECharts HTML"""
+    # 格式化日期并排序
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values(['Asset', 'Date'])
     
-    # 修复：将 max() 得到的 Timestamp 转为好看的 YYYY-MM-DD 字符串
-    latest_date_str = df['Date'].max().strftime('%Y-%m-%d')
+    # 转换为 JSON 格式供前端使用
+    assets = sorted(df['Asset'].unique().tolist())
+    full_data = {}
+    for asset in assets:
+        sub = df[df['Asset'] == asset]
+        full_data[asset] = {
+            'dates': sub['Date'].dt.strftime('%Y-%m-%d').tolist(),
+            'longs': sub['Long'].tolist(),
+            'shorts': sub['Short'].tolist(),
+            'nets': sub['Net'].tolist()
+        }
+
+    latest_date = df['Date'].max().strftime('%Y-%m-%d')
     
-    # 准备 HTML 模板
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <title>CFTC 历史持仓趋势面板</title>
-        <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #f5f7fa; margin: 0; padding: 20px; }
-            h1 { text-align: center; color: #333; margin-bottom: 5px; }
-            .meta-info { text-align: center; color: #888; font-size: 14px; margin-bottom: 30px; }
-            .grid-container { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; }
-            .chart-card { background: #fff; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 15px; width: 48%; min-width: 600px; box-sizing: border-box; }
-            .chart { width: 100%; height: 400px; }
-        </style>
-    </head>
-    <body>
-        <h1>CFTC 大类资产多空趋势面板</h1>
-        <div class="meta-info">数据更新至: {latest_date} | 图表支持缩放、拖拽和图例点击</div>
-        <div class="grid-container">
-    """
-    
-    html_content = html_content.replace("{latest_date}", latest_date_str)
-    
-    charts_js = ""
-    
-    # 为每个资产生成一个图表容器和配置
-    for i, asset in enumerate(assets):
-        asset_data = df[df['Asset'] == asset].sort_values('Date')
+    html_template = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>CFTC 历史数据交互面板</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <style>
+        body {{ display: flex; height: 100vh; margin: 0; font-family: sans-serif; background: #f0f2f5; }}
+        #sidebar {{ 
+            width: 260px; background: #fff; border-right: 1px solid #ddd; 
+            display: flex; flex-direction: column; overflow: hidden;
+        }}
+        .search-box {{ padding: 15px; border-bottom: 1px solid #eee; }}
+        #assetSearch {{ width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }}
+        #assetList {{ flex: 1; overflow-y: auto; padding: 10px; }}
+        .asset-btn {{ 
+            width: 100%; text-align: left; padding: 10px 15px; margin-bottom: 5px;
+            border: none; background: transparent; cursor: pointer; border-radius: 4px;
+            font-size: 14px; color: #333; transition: all 0.2s;
+        }}
+        .asset-btn:hover {{ background: #e6f7ff; color: #1890ff; }}
+        .asset-btn.active {{ background: #1890ff; color: #fff; font-weight: bold; }}
         
-        # 修复：将 Pandas Timestamp 转换回普通的字符串列表，以便 JSON 序列化
-        dates = asset_data['Date'].dt.strftime('%Y-%m-%d').tolist()
-        
-        longs = asset_data['Long'].tolist()
-        shorts = asset_data['Short'].tolist()
-        nets = asset_data['Net'].tolist()
-        
-        chart_id = f"chart_{i}"
-        
-        # 添加 DOM 容器
-        html_content += f"""
-            <div class="chart-card">
-                <div id="{chart_id}" class="chart"></div>
-            </div>
-        """
-        
-        # 组装 ECharts JS 配置
-        charts_js += f"""
-            var myChart_{i} = echarts.init(document.getElementById('{chart_id}'));
-            var option_{i} = {{
-                title: {{ text: '{asset} - 多空持仓演变', left: 'center', textStyle: {{color: '#4472C4'}} }},
+        #main {{ flex: 1; display: flex; flex-direction: column; padding: 20px; }}
+        header {{ margin-bottom: 20px; background: #fff; padding: 15px 25px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }}
+        h1 {{ margin: 0; font-size: 20px; color: #1a1a1a; }}
+        .info {{ color: #888; font-size: 13px; margin-top: 5px; }}
+        #chart-container {{ flex: 1; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); padding: 20px; }}
+    </style>
+</head>
+<body>
+    <div id="sidebar">
+        <div class="search-box">
+            <input type="text" id="assetSearch" placeholder="搜索资产名称...">
+        </div>
+        <div id="assetList"></div>
+    </div>
+    <div id="main">
+        <header>
+            <h1 id="currentAsset">请选择资产</h1>
+            <div class="info">历史数据区间: {df['Date'].min().strftime('%Y-%m-%d')} 至 {latest_date} | 数据来源: CFTC</div>
+        </header>
+        <div id="chart-container">
+            <div id="chart" style="width: 100%; height: 100%;"></div>
+        </div>
+    </div>
+
+    <script>
+        const rawData = {json.dumps(full_data)};
+        const assetList = {json.dumps(assets)};
+        let myChart = echarts.init(document.getElementById('chart'));
+
+        function renderAssetList(filter = '') {{
+            const container = document.getElementById('assetList');
+            container.innerHTML = '';
+            assetList.filter(a => a.toLowerCase().includes(filter.toLowerCase())).forEach(asset => {{
+                const btn = document.createElement('button');
+                btn.className = 'asset-btn';
+                btn.innerText = asset;
+                btn.onclick = () => selectAsset(asset, btn);
+                container.appendChild(btn);
+            }});
+        }}
+
+        function selectAsset(name, btnElement) {{
+            document.querySelectorAll('.asset-btn').forEach(b => b.classList.remove('active'));
+            if(btnElement) btnElement.classList.add('active');
+            document.getElementById('currentAsset').innerText = name + " - 历史持仓趋势分析";
+            
+            const data = rawData[name];
+            const option = {{
                 tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'cross' }} }},
-                legend: {{ data: ['多头 (Long)', '空头 (Short)', '净持仓 (Net)'], top: 30 }},
-                grid: {{ left: '3%', right: '4%', bottom: '15%', containLabel: true }},
+                legend: {{ data: ['多头 (Long)', '空头 (Short)', '净持仓 (Net)'], top: 0 }},
+                grid: {{ left: '3%', right: '4%', bottom: '8%', containLabel: true }},
                 dataZoom: [{{ type: 'slider', start: 0, end: 100 }}, {{ type: 'inside' }}],
-                xAxis: {{ type: 'category', boundaryGap: true, data: {json.dumps(dates)} }},
-                yAxis: [
-                    {{ type: 'value', name: '合约数量', position: 'left', splitLine: {{ lineStyle: {{ type: 'dashed' }} }} }}
-                ],
+                xAxis: {{ type: 'category', data: data.dates, boundaryGap: true }},
+                yAxis: {{ type: 'value', name: '合约数量', splitLine: {{ lineStyle: {{ type: 'dashed' }} }} }},
                 series: [
-                    {{
-                        name: '多头 (Long)',
-                        type: 'line',
-                        itemStyle: {{ color: '#d62728' }}, // 红色
-                        lineStyle: {{ width: 3 }},
-                        showSymbol: false,
-                        smooth: true,
-                        data: {json.dumps(longs)}
-                    }},
-                    {{
-                        name: '空头 (Short)',
-                        type: 'line',
-                        itemStyle: {{ color: '#2ca02c' }}, // 绿色
-                        lineStyle: {{ width: 3 }},
-                        showSymbol: false,
-                        smooth: true,
-                        data: {json.dumps(shorts)}
-                    }},
-                    {{
-                        name: '净持仓 (Net)',
-                        type: 'bar',
-                        itemStyle: {{ 
-                            color: function(params) {{ return params.data >= 0 ? 'rgba(68, 114, 196, 0.4)' : 'rgba(255, 127, 14, 0.4)'; }}
-                        }},
-                        barMaxWidth: 30,
-                        data: {json.dumps(nets)}
+                    {{ name: '多头 (Long)', type: 'line', data: data.longs, itemStyle: {{color: '#d62728'}}, smooth: true, showSymbol: false, lineStyle: {{width: 3}} }},
+                    {{ name: '空头 (Short)', type: 'line', data: data.shorts, itemStyle: {{color: '#2ca02c'}}, smooth: true, showSymbol: false, lineStyle: {{width: 3}} }},
+                    {{ name: '净持仓 (Net)', type: 'bar', data: data.nets, 
+                       itemStyle: {{ color: (p) => p.data >= 0 ? 'rgba(68, 114, 196, 0.4)' : 'rgba(255, 127, 14, 0.4)' }} 
                     }}
                 ]
             }};
-            myChart_{i}.setOption(option_{i});
-        """
+            myChart.setOption(option, true);
+        }}
 
-    html_content += """
-        </div>
-        <script>
-            // 渲染所有图表
-            setTimeout(function() {
+        // 搜索功能
+        document.getElementById('assetSearch').oninput = (e) => renderAssetList(e.target.value);
+
+        // 初始化
+        renderAssetList();
+        if (assetList.length > 0) {{
+            const firstBtn = document.querySelector('.asset-btn');
+            selectAsset(assetList[0], firstBtn);
+        }}
+
+        window.onresize = () => myChart.resize();
+    </script>
+</body>
+</html>
     """
-    html_content += charts_js
-    html_content += """
-            }, 100);
-            
-            // 响应窗口大小改变
-            window.addEventListener('resize', function() {
-                var charts = document.querySelectorAll('.chart');
-                charts.forEach(function(chartDiv) {
-                    var chart = echarts.getInstanceByDom(chartDiv);
-                    if (chart) { chart.resize(); }
-                });
-            });
-        </script>
-    </body>
-    </html>
-    """
-    
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-    
-    print(f"\n🎉 成功生成可视化面板：{OUTPUT_FILE}")
-    print(f"👉 请双击打开 {OUTPUT_FILE} 在浏览器中查看！")
+        f.write(html_template)
+    print(f"\n🎉 交互式面板已生成: {OUTPUT_FILE}")
 
 def main():
     files = sorted(glob.glob(HTML_PATTERN))
     if not files:
-        print(f"❌ 找不到任何符合 {HTML_PATTERN} 的文件。请确认当前目录下包含生成的 HTML 报告。")
+        print("❌ 未找到 HTML 文件")
         return
         
-    print(f"🔍 找到 {len(files)} 份 CFTC 报告，开始解析...")
-    
     all_data = []
-    
-    # Ctrl+C 中断捕获逻辑
     try:
-        for i, filepath in enumerate(files, 1):
-            sys.stdout.write(f"\r⏳ 正在解析进度: [{i}/{len(files)}] - {os.path.basename(filepath)}...")
-            sys.stdout.flush()
-            
-            parsed_rows = parse_html_file(filepath)
-            all_data.extend(parsed_rows)
-            
+        for i, f in enumerate(files, 1):
+            sys.stdout.write(f"\r⏳ 解析进度: [{i}/{len(files)}] {os.path.basename(f)}")
+            all_data.extend(parse_html_file(f))
     except KeyboardInterrupt:
-        # 当用户按下 Ctrl+C 时触发
-        print("\n\n🛑 检测到 [Ctrl+C] 中断！停止读取剩余文件。")
-        print("💡 正在使用【已成功读取】的数据为您生成图表，请稍候...")
+        print("\n🛑 用户中断，正在生成部分数据图表...")
     
-    if not all_data:
-        print("\n❌ 提取失败：没有提取到任何有效数据。")
-        return
-        
-    # 将提取的数据转换为 DataFrame 并按日期去重/清理
-    df = pd.DataFrame(all_data)
-    df['Date'] = pd.to_datetime(df['Date'])
-    
-    print(f"\n📊 正在处理 {len(df['Asset'].unique())} 种大类资产的时间序列...")
-    
-    # 调用生成 HTML 引擎
-    generate_echarts_html(df)
+    if all_data:
+        df = pd.DataFrame(all_data)
+        generate_dashboard(df)
+    else:
+        print("\n❌ 无有效数据")
 
 if __name__ == "__main__":
     main()
