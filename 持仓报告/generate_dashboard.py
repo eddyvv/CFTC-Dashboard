@@ -6,6 +6,7 @@ import sys
 import time
 import pandas as pd
 import akshare as ak
+import yfinance as yf
 from bs4 import BeautifulSoup
 import warnings
 warnings.filterwarnings('ignore')
@@ -34,15 +35,19 @@ ASSET_CONFIG = {
     '纳斯达克100': {'type': 'index_sina', 'symbol': '.NDX', 'fallback_etf': 'QQQ', 'desc': '纳斯达克100原生指数'},
     '日经225': {'type': 'index_investing', 'country': '日本', 'index_name': '日经225', 'fallback_etf': 'EWJ', 'desc': '日经225原生指数'},
     
-    # 外汇与部分宽基 (依然使用高流动性 ETF 代理，确保数据100%稳定)
+    # 外汇原生汇率指数 (通过 YFinance 获取真实汇率, 带 ETF 降级)
+    '欧元/美元': {'type': 'yf_asset', 'symbol': 'EURUSD=X', 'fallback_etf': 'FXE', 'desc': 'EUR/USD 原生汇率指数'},
+    '英镑/美元': {'type': 'yf_asset', 'symbol': 'GBPUSD=X', 'fallback_etf': 'FXB', 'desc': 'GBP/USD 原生汇率指数'},
+    '日元/美元': {'type': 'yf_asset', 'symbol': 'JPYUSD=X', 'fallback_etf': 'FXY', 'desc': 'JPY/USD 原生汇率指数'},
+    '澳元/美元': {'type': 'yf_asset', 'symbol': 'AUDUSD=X', 'fallback_etf': 'FXA', 'desc': 'AUD/USD 原生汇率指数'},
+    
+    # 比特币 CME 官方期货
+    '比特币': {'type': 'yf_asset', 'symbol': 'BTC=F', 'fallback_etf': 'BITO', 'desc': 'CME 比特币期货 (BTC=F)'},
+
+    # 其他外汇与宽基 (使用高流动性 ETF 代理，确保数据100%稳定)
     '罗素2000': {'type': 'etf_proxy', 'symbol': 'IWM', 'desc': 'IWM ETF 代理'},
     'MSCI新兴市场': {'type': 'etf_proxy', 'symbol': 'EEM', 'desc': 'EEM ETF 代理'},
     'MSCI发达市场': {'type': 'etf_proxy', 'symbol': 'EFA', 'desc': 'EFA ETF 代理'},
-    '比特币': {'type': 'etf_proxy', 'symbol': 'BITO', 'desc': 'BITO 比特币期货 ETF'},
-    '欧元/美元': {'type': 'etf_proxy', 'symbol': 'FXE', 'desc': 'FXE 欧元信托'},
-    '英镑/美元': {'type': 'etf_proxy', 'symbol': 'FXB', 'desc': 'FXB 英镑信托'},
-    '日元/美元': {'type': 'etf_proxy', 'symbol': 'FXY', 'desc': 'FXY 日元信托'},
-    '澳元/美元': {'type': 'etf_proxy', 'symbol': 'FXA', 'desc': 'FXA 澳元信托'},
     '联邦基金': {'type': 'etf_proxy', 'symbol': 'BIL', 'desc': 'BIL 短债基准代理'}
 }
 # ==========================================
@@ -80,11 +85,14 @@ def parse_html_file(filepath):
         pass
     return data_list
 
-def enrich_with_prices_akshare(df):
-    """使用 AKShare 精准拉取各类资产历史数据 (包含原生指数)"""
-    print("\n🌐 开始通过 AKShare 国内数据源拉取资产走势 (无封禁风险)...")
+def enrich_with_prices(df):
+    """根据资产类别使用最优数据源精准拉取历史数据"""
+    print("\n🌐 开始自动分配最佳数据源拉取资产走势 (支持无缝降级保护)...")
     df['Price'] = None
     assets = df['Asset'].unique()
+    
+    min_date = df['Date'].min() - pd.Timedelta(days=7)
+    max_date = df['Date'].max() + pd.Timedelta(days=7)
     
     # 1. 预先拉取【美债收益率】数据池
     yield_data_cache = None
@@ -96,7 +104,7 @@ def enrich_with_prices_akshare(df):
     except Exception as e:
         print(f"⚠️ 宏观利率初始化失败: {e}")
 
-    # 2. 逐一拉取其余资产
+    # 2. 逐一分类拉取其余资产
     for asset in assets:
         if asset not in ASSET_CONFIG:
             continue
@@ -137,7 +145,6 @@ def enrich_with_prices_akshare(df):
 
             # --- 策略 D：全球核心指数 (Investing 接口) ---
             elif cfg['type'] == 'index_investing':
-                # 注意: Investing 接口不稳定，已配备 try-except 降级
                 hist = ak.index_investing_global(
                     country=cfg['country'], 
                     index_name=cfg['index_name'], 
@@ -148,10 +155,21 @@ def enrich_with_prices_akshare(df):
                 if not hist.empty and '收盘' in hist.columns and '日期' in hist.columns:
                     hist['date'] = pd.to_datetime(hist['日期'])
                     hist.set_index('date', inplace=True)
-                    # 处理千分位逗号
                     close_px = hist['收盘'].astype(str).str.replace(',', '').astype(float).dropna()
+                    
+            # --- 策略 E：混合 Yahoo Finance (针对外汇指数与加密期货) ---
+            elif cfg['type'] == 'yf_asset':
+                try:
+                    ticker_obj = yf.Ticker(cfg['symbol'])
+                    hist = ticker_obj.history(start=min_date.strftime('%Y-%m-%d'), end=max_date.strftime('%Y-%m-%d'))
+                    if not hist.empty and 'Close' in hist.columns:
+                        if hist.index.tz is not None:
+                            hist.index = hist.index.tz_localize(None)
+                        close_px = hist['Close'].astype(float).dropna()
+                except Exception:
+                    pass # 失败则留空，交由下方的防断连降级保护处理
             
-            # --- 策略 E：ETF 代理 ---
+            # --- 策略 F：ETF 代理 ---
             elif cfg['type'] == 'etf_proxy':
                 hist = ak.stock_us_daily(symbol=cfg['symbol'], adjust="qfq")
                 if not hist.empty:
@@ -161,7 +179,7 @@ def enrich_with_prices_akshare(df):
                         hist.set_index('date', inplace=True)
                         close_px = hist['close'].astype(float).dropna()
 
-            # --- 防断连降级保护 (如果原生指数获取失败，自动用 ETF 补位) ---
+            # --- 防断连降级保护 (如果原生指数/外汇获取失败，自动用 ETF 补位) ---
             if close_px.empty and 'fallback_etf' in cfg:
                 sys.stdout.write(f" [降级使用 ETF: {cfg['fallback_etf']}] ")
                 sys.stdout.flush()
@@ -191,28 +209,11 @@ def enrich_with_prices_akshare(df):
                         
                 df.loc[mask, 'Price'] = prices
                 
-            # 温和休眠，保护 IP 不被新浪/Investing 封禁
-            time.sleep(0.8)
+            # 温和休眠，保护 IP
+            time.sleep(1.0)
             
         except Exception as e:
-            # 如果发生严重报错，依然尝试触发降级
-            if 'fallback_etf' in cfg:
-                try:
-                    sys.stdout.write(f" [异常降级 ETF: {cfg['fallback_etf']}] ")
-                    hist = ak.stock_us_daily(symbol=cfg['fallback_etf'], adjust="qfq")
-                    hist.columns = [str(c).lower() for c in hist.columns]
-                    hist['date'] = pd.to_datetime(hist['date'])
-                    hist.set_index('date', inplace=True)
-                    close_px = hist['close'].astype(float).dropna()
-                    
-                    mask = df['Asset'] == asset
-                    asset_dates = df.loc[mask, 'Date']
-                    prices = [float(close_px[close_px.index <= d].iloc[-1]) if not close_px[close_px.index <= d].empty else None for d in asset_dates]
-                    df.loc[mask, 'Price'] = prices
-                except:
-                    print(f"\n⚠️ {asset} 彻底获取失败: {e}")
-            else:
-                print(f"\n⚠️ {asset} 获取遭遇异常: {e}")
+            print(f"\n⚠️ {asset} 获取遭遇异常: {e}")
             
     print("\n✅ 所有资产网络数据匹配完成！")
     return df
@@ -265,6 +266,7 @@ def generate_dashboard(df):
         .type-futures {{ background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }}
         .type-proxy {{ background: #e6f7ff; color: #1890ff; border: 1px solid #91d5ff; }}
         .type-index {{ background: #f9f0ff; color: #722ed1; border: 1px solid #d3adf7; }}
+        .type-yf {{ background: #fffbe6; color: #fa8c16; border: 1px solid #ffe58f; }}
         .info {{ color: #666; font-size: 14px; display: flex; flex-direction: column; gap: 5px; }}
         .sub-info {{ font-size: 13px; color: #888; }}
         #chart-container {{ flex: 1; background: #fff; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); padding: 20px; min-height: 400px; }}
@@ -273,7 +275,7 @@ def generate_dashboard(df):
 <body>
     <div id="sidebar">
         <div class="search-box">
-            <input type="text" id="assetSearch" placeholder="🔍 搜索资产 (如: 美债, 标普)">
+            <input type="text" id="assetSearch" placeholder="🔍 搜索资产 (如: 美债, 外汇)">
         </div>
         <div id="assetList"></div>
     </div>
@@ -333,17 +335,22 @@ def generate_dashboard(df):
             }} else if (cfg.type === 'futures') {{
                 badge.className = 'badge-type type-futures';
                 badge.innerText = '外盘商品期货';
-                desc.innerHTML = '💡 <strong>数据说明：</strong>紫线为原汁原味的海外官方主力连续合约美元报价。';
+                desc.innerHTML = '💡 <strong>数据说明：</strong>紫线为海外官方主力连续合约美元报价。';
                 priceAxisName = '期货报价 ($)';
             }} else if (cfg.type === 'index_sina' || cfg.type === 'index_investing') {{
                 badge.className = 'badge-type type-index';
                 badge.innerText = '原生指数走势';
-                desc.innerHTML = '💡 <strong>数据说明：</strong>直接获取官方核心指数的绝对点数 (如标普点数、日经点数)。';
+                desc.innerHTML = '💡 <strong>数据说明：</strong>直接获取官方核心指数的绝对点数。';
                 priceAxisName = '指数点数';
+            }} else if (cfg.type === 'yf_asset') {{
+                badge.className = 'badge-type type-yf';
+                badge.innerText = name.includes('比特币') ? '原生期货合约' : '原生汇率指数';
+                desc.innerHTML = '💡 <strong>数据说明：</strong>精准对接 <strong>' + cfg.symbol + '</strong> 原生行情走势。';
+                priceAxisName = name.includes('比特币') ? '期货报价 ($)' : '汇率指数';
             }} else if (cfg.type === 'etf_proxy') {{
                 badge.className = 'badge-type type-proxy';
                 badge.innerText = '指数 ETF 穿透代理';
-                desc.innerHTML = '💡 <strong>数据说明：</strong>该品种使用高流动性 ETF (<strong>' + cfg.symbol + '</strong>) 代理真实走势。';
+                desc.innerHTML = '💡 <strong>数据说明：</strong>使用高流动性 ETF (<strong>' + cfg.symbol + '</strong>) 代理真实走势。';
                 priceAxisName = 'ETF 价格 ($)';
             }}
 
@@ -362,9 +369,14 @@ def generate_dashboard(df):
                         params.forEach(param => {{
                             let val = param.value;
                             if (param.seriesIndex === 3 && val != null) {{
+                                // 智能动态小数位：汇率需要4位小数(如0.0065)，收益率3位，其余2位
+                                let decimals = 2;
+                                if (cfg.type === 'us_yield') decimals = 3;
+                                else if (name.includes('/') || name.includes('汇率')) decimals = 4; 
+                                
                                 val = Number(val).toLocaleString(undefined, {{
-                                    minimumFractionDigits: cfg.type === 'us_yield' ? 3 : 2, 
-                                    maximumFractionDigits: cfg.type === 'us_yield' ? 3 : 2
+                                    minimumFractionDigits: decimals, 
+                                    maximumFractionDigits: decimals
                                 }}) + tooltipUnit;
                             }} else if (val != null) {{
                                 val = Number(val).toLocaleString() + ' 手';
@@ -428,7 +440,7 @@ def generate_dashboard(df):
 
         renderAssetList();
         if (assetList.length > 0) {{
-            const defaultAsset = assetList.includes('标普500') ? '标普500' : assetList[0];
+            const defaultAsset = assetList.includes('欧元/美元') ? '欧元/美元' : assetList[0];
             const btns = Array.from(document.querySelectorAll('.asset-btn'));
             const targetBtn = btns.find(b => b.innerText === defaultAsset) || btns[0];
             selectAsset(defaultAsset, targetBtn);
@@ -462,8 +474,8 @@ def main():
         df = pd.DataFrame(all_data)
         df['Date'] = pd.to_datetime(df['Date'])
         
-        # 调用 AKShare 专属分类拉取引擎
-        df = enrich_with_prices_akshare(df)
+        # 调用智能分类数据拉取引擎
+        df = enrich_with_prices(df)
         generate_dashboard(df)
     else:
         print("\n❌ 未提取到任何有效数据。")
